@@ -1,25 +1,62 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import '../models/announced_service.dart';
 import '../models/device.dart';
+import '../services/advanced_discovery_coordinator.dart';
+import '../services/mdns_discovery_provider.dart';
 import '../services/port_scanner_service.dart';
 
 class DeviceDetailsScreen extends StatefulWidget {
   final Device device;
   final PortScannerService portScannerService;
+  final AdvancedDiscoveryCoordinator? discoveryCoordinator;
 
   const DeviceDetailsScreen({
     super.key,
     required this.device,
     this.portScannerService = const PortScannerService(),
+    this.discoveryCoordinator,
   });
 
   @override
   State<DeviceDetailsScreen> createState() => _DeviceDetailsScreenState();
 }
 
-class _DeviceDetailsScreenState extends State<DeviceDetailsScreen> {
+class _DeviceDetailsScreenState extends State<DeviceDetailsScreen>
+    with WidgetsBindingObserver {
   bool _isScanningPorts = false;
   bool _hasFinishedPortScanAttempt = false;
   String? _portScanError;
+  bool _isDiscoveringServices = false;
+  bool _hasFinishedDiscoveryAttempt = false;
+  String? _discoveryError;
+  late final AdvancedDiscoveryCoordinator _discoveryCoordinator;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _discoveryCoordinator =
+        widget.discoveryCoordinator ??
+        AdvancedDiscoveryCoordinator(providers: [MdnsDiscoveryProvider()]);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_discoveryCoordinator.cancel());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_discoveryCoordinator.dispose());
+    super.dispose();
+  }
 
   Future<void> _startPortScan({bool force = false}) async {
     if (_isScanningPorts || (!force && widget.device.isPortScanCompleted)) {
@@ -50,6 +87,63 @@ class _DeviceDetailsScreenState extends State<DeviceDetailsScreen> {
         });
       }
     }
+  }
+
+  Future<void> _startAdvancedDiscovery({bool force = false}) async {
+    final device = widget.device;
+    if (_isDiscoveringServices ||
+        (!force && device.isAdvancedDiscoveryCompleted)) {
+      return;
+    }
+
+    setState(() {
+      _isDiscoveringServices = true;
+      _discoveryError = null;
+    });
+
+    try {
+      final result = await _discoveryCoordinator.discover(
+        timeout: const Duration(seconds: 5),
+      );
+      if (result.cancelled) return;
+
+      if (force) {
+        device.announcedServices.clear();
+        device.discoveryProtocols.clear();
+      }
+      for (final discoveredDevice in result.devices) {
+        final sameIp = discoveredDevice.addresses.contains(device.ip);
+        final sameHostname = discoveredDevice.hostnames.any(
+          (hostname) => _sameHostname(hostname, device.hostname),
+        );
+        if (!sameIp && !sameHostname) continue;
+        for (final observation in discoveredDevice.observations) {
+          device.mergeDiscoveryObservation(observation);
+        }
+      }
+      device.isAdvancedDiscoveryCompleted = true;
+
+      if (result.errors.isNotEmpty && device.announcedServices.isEmpty) {
+        _discoveryError = 'No se pudo completar el descubrimiento mDNS.';
+      }
+    } catch (_) {
+      _discoveryError = 'No se pudo completar el descubrimiento mDNS.';
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isDiscoveringServices = false;
+          _hasFinishedDiscoveryAttempt = true;
+        });
+      }
+    }
+  }
+
+  bool _sameHostname(String first, String second) {
+    String normalize(String value) =>
+        value.trim().replaceFirst(RegExp(r'\.$'), '').toLowerCase();
+    final normalizedSecond = normalize(second);
+    return normalizedSecond != 'host desconocido' &&
+        normalize(first) == normalizedSecond;
   }
 
   IconData _getIconForService(int port, String serviceName) {
@@ -325,6 +419,9 @@ class _DeviceDetailsScreenState extends State<DeviceDetailsScreen> {
             ),
             const SizedBox(height: 16),
 
+            _buildAnnouncedServicesCard(context),
+            const SizedBox(height: 16),
+
             // Sección: Información adicional (placeholders para futuras iteraciones)
             Card(
               elevation: 0,
@@ -376,6 +473,143 @@ class _DeviceDetailsScreenState extends State<DeviceDetailsScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildAnnouncedServicesCard(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final services = [...widget.device.announcedServices]
+      ..sort((a, b) => a.instanceName.compareTo(b.instanceName));
+
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        side: BorderSide(color: colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ExpansionTile(
+        title: Text(
+          'Servicios anunciados',
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+            color: colorScheme.primary,
+          ),
+        ),
+        subtitle: const Text('mDNS y futuros protocolos de anuncio'),
+        leading: Icon(Icons.campaign, color: colorScheme.primary),
+        shape: const Border(),
+        collapsedShape: const Border(),
+        onExpansionChanged: (expanded) {
+          if (!expanded) return;
+          final hasExpiredServices = widget.device.hasExpiredAnnouncedServices;
+          if (!widget.device.isAdvancedDiscoveryCompleted ||
+              hasExpiredServices) {
+            widget.device.pruneExpiredAnnouncedServices();
+            _startAdvancedDiscovery(force: hasExpiredServices);
+          }
+        },
+        children: [
+          const Divider(height: 1),
+          if (_isDiscoveringServices)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(
+                child: Column(
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 12),
+                    Text(
+                      'Buscando anuncios mDNS...',
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else if (_discoveryError != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Icon(
+                    Icons.warning_amber_rounded,
+                    color: colorScheme.error,
+                    size: 32,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _discoveryError!,
+                    style: TextStyle(color: colorScheme.error),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ),
+            )
+          else if (widget.device.isAdvancedDiscoveryCompleted &&
+              services.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'No se detectaron servicios anunciados por este dispositivo.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.grey,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            )
+          else if (services.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Column(
+                children: services.map((service) {
+                  final endpoint = [
+                    if (service.hostname != null) service.hostname!,
+                    if (service.port != null) service.port.toString(),
+                  ].join(':');
+                  return ListTile(
+                    leading: Icon(
+                      Icons.wifi_tethering,
+                      color: colorScheme.secondary,
+                    ),
+                    title: Text(
+                      service.instanceName,
+                      style: const TextStyle(fontWeight: FontWeight.w500),
+                    ),
+                    subtitle: Text(
+                      [
+                        '${service.protocol.label} · ${service.serviceType}',
+                        if (endpoint.isNotEmpty) endpoint,
+                      ].join('\n'),
+                    ),
+                    isThreeLine: endpoint.isNotEmpty,
+                  );
+                }).toList(),
+              ),
+            )
+          else
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'Toca para buscar servicios anunciados',
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+          if (widget.device.isAdvancedDiscoveryCompleted ||
+              _hasFinishedDiscoveryAttempt)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: OutlinedButton.icon(
+                onPressed: _isDiscoveringServices
+                    ? null
+                    : () => _startAdvancedDiscovery(force: true),
+                icon: const Icon(Icons.refresh),
+                label: const Text('Volver a buscar servicios anunciados'),
+              ),
+            ),
+        ],
       ),
     );
   }

@@ -49,6 +49,9 @@ Future<void> _pumpDetails(
   );
 }
 
+Finder get _tcpServicesTile =>
+    find.widgetWithText(ExpansionTile, 'Servicios detectados');
+
 void main() {
   test('service map contains only the TCP ports supported by v5.1', () {
     expect(PortScannerService.serviceMap, {
@@ -92,7 +95,7 @@ void main() {
       final device = _buildDevice();
       await _pumpDetails(tester, device, scanner);
 
-      await tester.tap(find.byType(ExpansionTile));
+      await tester.tap(_tcpServicesTile);
       await tester.pump();
 
       expect(scanner.callCount, 1);
@@ -108,9 +111,9 @@ void main() {
       expect(device.isPortScanCompleted, isTrue);
       expect(find.text('Volver a escanear servicios'), findsOneWidget);
 
-      await tester.tap(find.byType(ExpansionTile));
+      await tester.tap(_tcpServicesTile);
       await tester.pumpAndSettle();
-      await tester.tap(find.byType(ExpansionTile));
+      await tester.tap(_tcpServicesTile);
       await tester.pumpAndSettle();
 
       expect(scanner.callCount, 1);
@@ -142,7 +145,7 @@ void main() {
     final scanner = _ControlledPortScannerService();
     await _pumpDetails(tester, _buildDevice(), scanner);
 
-    await tester.tap(find.byType(ExpansionTile));
+    await tester.tap(_tcpServicesTile);
     await tester.pump();
     scanner.attempts.single.complete({});
     await tester.pumpAndSettle();
@@ -155,7 +158,7 @@ void main() {
     final scanner = _ControlledPortScannerService();
     await _pumpDetails(tester, _buildDevice(), scanner);
 
-    await tester.tap(find.byType(ExpansionTile));
+    await tester.tap(_tcpServicesTile);
     await tester.pump();
     scanner.attempts.single.completeError(Exception('scan failed'));
     await tester.pumpAndSettle();
